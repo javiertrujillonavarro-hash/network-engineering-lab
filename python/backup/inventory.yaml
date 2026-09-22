@@ -1,0 +1,21 @@
+devices:
+
+  - name: R1
+    host: 192.168.1.55
+    platform: cisco_ios
+
+  - name: R2
+    host: 192.168.1.56
+    platform: cisco_ios
+
+  - name: R3
+    host: 192.168.1.37
+    platform: cisco_ios
+
+  - name: R4
+    host: 192.168.1.54
+    platform: cisco_ios
+
+  - name: R5
+    host: 192.168.1.57
+    platform: cisco_ios

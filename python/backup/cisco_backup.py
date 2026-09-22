@@ -1,44 +1,182 @@
-from netmiko import ConnectHandler
+import os
 from datetime import datetime
 from pathlib import Path
 
-
-device = {
-    "device_type": "cisco_ios",
-    "host": "192.168.1.37",
-    "username": "admin",
-    "password": "Tu_Password",
-    "port": 22,
-}
+import yaml
+from dotenv import load_dotenv
+from netmiko import ConnectHandler
 
 
-# Directorio donde está este script
-backup_dir = Path(__file__).parent
+# ============================================
+# CARGAR VARIABLES DE ENTORNO
+# ============================================
 
-# Fecha y hora del backup
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+load_dotenv()
 
-# Nombre del archivo
-backup_file = backup_dir / f"R1_{timestamp}.cfg"
+username = os.getenv("CISCO_USERNAME")
+password = os.getenv("CISCO_PASSWORD")
 
 
-print(f"Conectando a {device['host']}...")
+# ============================================
+# RUTAS
+# ============================================
 
-connection = ConnectHandler(**device)
+script_dir = Path(__file__).parent
 
-print("Conexión establecida")
+inventory_file = script_dir / "inventory.yaml"
 
-print("Obteniendo configuración...")
+backup_dir = script_dir
 
-config = connection.send_command("show running-config")
 
-# Guardar configuración
-backup_file.write_text(config, encoding="utf-8")
+# ============================================
+# CARGAR INVENTARIO YAML
+# ============================================
 
-print(f"Backup guardado en:")
-print(backup_file)
+with open(inventory_file, "r", encoding="utf-8") as file:
+    inventory = yaml.safe_load(file)
 
-connection.disconnect()
+devices = inventory["devices"]
 
-print("Conexión cerrada")
-print("Backup completado correctamente.")
+
+# ============================================
+# INFORMACIÓN INICIAL
+# ============================================
+
+print()
+print("========================================")
+print("       CISCO NETWORK BACKUP")
+print("========================================")
+print()
+
+print(f"Devices found in inventory: {len(devices)}")
+print()
+
+
+# ============================================
+# VARIABLES DE RESULTADO
+# ============================================
+
+successful = 0
+failed = 0
+
+
+# ============================================
+# PROCESAR DISPOSITIVOS
+# ============================================
+
+for device_info in devices:
+
+    name = device_info["name"]
+    host = device_info["host"]
+    platform = device_info["platform"]
+
+    print("----------------------------------------")
+    print(f"Device : {name}")
+    print(f"IP     : {host}")
+    print("----------------------------------------")
+
+    device = {
+        "device_type": platform,
+        "host": host,
+        "username": username,
+        "password": password,
+        "port": 22,
+    }
+
+    connection = None
+
+    try:
+
+        # ------------------------------------
+        # CONEXIÓN
+        # ------------------------------------
+
+        print(f"Connecting to {name}...")
+
+        connection = ConnectHandler(**device)
+
+        print(f"[OK] Connected to {name}")
+
+        # ------------------------------------
+        # OBTENER RUNNING CONFIG
+        # ------------------------------------
+
+        print("Getting running configuration...")
+
+        config = connection.send_command(
+            "show running-config"
+        )
+
+        # ------------------------------------
+        # CREAR NOMBRE DEL BACKUP
+        # ------------------------------------
+
+        timestamp = datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+
+        backup_file = (
+            backup_dir /
+            f"{name}_{timestamp}.cfg"
+        )
+
+        # ------------------------------------
+        # GUARDAR BACKUP
+        # ------------------------------------
+
+        backup_file.write_text(
+            config,
+            encoding="utf-8"
+        )
+
+        print(
+            f"[OK] Backup saved: {backup_file.name}"
+        )
+
+        successful += 1
+
+    except Exception as error:
+
+        print(f"[ERROR] {name}: {error}")
+
+        failed += 1
+
+    finally:
+
+        # ------------------------------------
+        # CERRAR CONEXIÓN
+        # ------------------------------------
+
+        if connection:
+
+            connection.disconnect()
+
+            print(
+                f"[OK] Connection closed: {name}"
+            )
+
+    print()
+
+
+# ============================================
+# RESUMEN
+# ============================================
+
+print("========================================")
+print("           BACKUP SUMMARY")
+print("========================================")
+
+print(f"Total devices : {len(devices)}")
+print(f"Successful    : {successful}")
+print(f"Failed        : {failed}")
+
+print("========================================")
+print()
+
+if failed == 0:
+
+    print("BACKUP COMPLETED SUCCESSFULLY")
+
+else:
+
+    print("BACKUP COMPLETED WITH ERRORS")
