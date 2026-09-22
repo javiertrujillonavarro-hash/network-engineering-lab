@@ -1,6 +1,8 @@
 import os
 import re
+import json
 from pathlib import Path
+from datetime import datetime
 
 import yaml
 from dotenv import load_dotenv
@@ -18,9 +20,12 @@ PASSWORD = os.getenv("CISCO_PASSWORD")
 
 SCRIPT_DIR = Path(__file__).parent
 INVENTORY_FILE = SCRIPT_DIR.parent / "backup" / "inventory.yaml"
+REPORT_DIR = SCRIPT_DIR / "reports"
+PAGES_DIR = SCRIPT_DIR.parent.parent / "docs"
+PAGES_DIR.mkdir(exist_ok=True)
 
+REPORT_DIR.mkdir(exist_ok=True)
 
-# Thresholds
 CPU_WARNING = 70
 CPU_CRITICAL = 90
 
@@ -29,13 +34,14 @@ MEMORY_CRITICAL = 90
 
 
 # ============================================================
-# COLORS / STATUS
+# COLORS
 # ============================================================
 
-GREEN = "\033[92m"
-YELLOW = "\033[93m"
-RED = "\033[91m"
 RESET = "\033[0m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+GREEN = "\033[92m"
+CYAN = "\033[96m"
 
 
 def status_ok(text):
@@ -56,13 +62,17 @@ def status_critical(text):
 
 def get_cpu(connection):
 
-    output = connection.send_command(
-        "show processes cpu | include CPU utilization"
-    )
+    output = connection.send_command("show processes cpu | include CPU utilization")
 
     match = re.search(
-        r"five minutes:\s+(\d+)%",
-        output
+        r"five seconds:\s+(\d+)%", output
+    )
+
+    if match:
+        return int(match.group(1))
+
+    match = re.search(
+        r"CPU utilization.*?(\d+)%", output
     )
 
     if match:
@@ -77,14 +87,10 @@ def get_cpu(connection):
 
 def get_memory(connection):
 
-    output = connection.send_command(
-        "show processes memory | include Processor Pool"
-    )
+    output = connection.send_command("show processes memory | include Processor")
 
     match = re.search(
-        r"Processor Pool Total:\s+(\d+).*?Used:\s+(\d+)",
-        output,
-        re.S,
+        r"Processor Pool Total:\s+(\d+)\s+Used:\s+(\d+)", output
     )
 
     if match:
@@ -104,15 +110,15 @@ def get_memory(connection):
 
 def get_interfaces(connection):
 
-    output = connection.send_command(
-        "show ip interface brief"
-    )
+    output = connection.send_command("show ip interface brief")
 
     interfaces = []
 
     for line in output.splitlines():
 
-        if not line.strip():
+        line = line.strip()
+
+        if not line:
             continue
 
         if line.startswith("Interface"):
@@ -124,14 +130,20 @@ def get_interfaces(connection):
             continue
 
         interface = parts[0]
-        ip_address = parts[1]
-        status = parts[-2]
+
         protocol = parts[-1]
+
+        if parts[-3] == "administratively":
+
+            status = "administratively"
+
+        else:
+
+            status = parts[-2]
 
         interfaces.append(
             {
                 "interface": interface,
-                "ip": ip_address,
                 "status": status,
                 "protocol": protocol,
             }
@@ -140,17 +152,11 @@ def get_interfaces(connection):
     return interfaces
 
 
-# ============================================================
-# INTERFACE ANALYSIS
-# ============================================================
-
 def analyze_interfaces(interfaces):
 
     up = 0
     admin_down = 0
     operational_down = 0
-
-    problems = []
 
     for interface in interfaces:
 
@@ -161,7 +167,7 @@ def analyze_interfaces(interfaces):
 
             up += 1
 
-        elif status == "administratively" and protocol == "down":
+        elif status == "administratively":
 
             admin_down += 1
 
@@ -169,14 +175,11 @@ def analyze_interfaces(interfaces):
 
             operational_down += 1
 
-            problems.append(interface)
-
-    return (
-        up,
-        admin_down,
-        operational_down,
-        problems,
-    )
+    return {
+        "up": up,
+        "administratively_down": admin_down,
+        "operational_down": operational_down,
+    }
 
 
 # ============================================================
@@ -186,36 +189,40 @@ def analyze_interfaces(interfaces):
 def get_bgp(connection):
 
     output = connection.send_command(
-        "show ip bgp summary"
+        "show ip bgp summary",
+        use_textfsm=False
     )
 
     if (
         "BGP router identifier" not in output
         and "BGP table version" not in output
     ):
-        return None, None
+        return None
 
+    neighbors = 0
     established = 0
-    down = 0
 
     for line in output.splitlines():
 
         parts = line.split()
 
-        if len(parts) < 3:
+        if len(parts) < 9:
             continue
 
         if re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
 
-            last_field = parts[-1]
+            neighbors += 1
 
-            if last_field.isdigit():
+            last = parts[-1]
+
+            if last.isdigit():
+
                 established += 1
 
-            else:
-                down += 1
-
-    return established, down
+    return {
+        "neighbors": neighbors,
+        "established": established,
+    }
 
 
 # ============================================================
@@ -228,133 +235,515 @@ def get_ospf(connection):
         "show ip ospf neighbor"
     )
 
-    if not output.strip():
-
-        return None, None
-
     if (
-        "Neighbor ID" not in output
-        and "Neighbor" not in output
+        "OSPF not enabled" in output
+        or "not running" in output
     ):
+        return None
 
-        return None, None
-
-    established = 0
-    down = 0
+    neighbors = 0
 
     for line in output.splitlines():
 
-        if "FULL" in line:
+        parts = line.split()
 
-            established += 1
+        if len(parts) >= 6:
 
-        elif any(
-            state in line
-            for state in [
-                "DOWN",
-                "INIT",
-                "EXSTART",
-                "EXCHANGE",
-                "LOADING",
-            ]
-        ):
+            if re.match(
+                r"^\d+\.\d+\.\d+\.\d+$",
+                parts[0]
+            ):
 
-            down += 1
+                neighbors += 1
 
-    return established, down
+    return {
+        "neighbors": neighbors
+    }
 
 
 # ============================================================
-# DEVICE STATUS
+# DEVICE ANALYSIS
 # ============================================================
 
-def analyze_device(result):
+def analyze_device(device):
 
-    alerts = []
+    name = device["name"]
+    host = device["host"]
+    platform = device.get("platform", "cisco_ios")
 
-    # Device connectivity
+    result = {
+
+        "name": name,
+        "host": host,
+        "platform": platform,
+
+        "status": "DOWN",
+
+        "cpu": None,
+        "memory": None,
+
+        "interfaces": {
+            "up": 0,
+            "administratively_down": 0,
+            "operational_down": 0,
+        },
+
+        "bgp": None,
+        "ospf": None,
+
+        "alerts": [],
+
+    }
+
+    print()
+    print("-" * 78)
+    print(f"{CYAN}{name} ({host}){RESET}")
+    print("-" * 78)
+
+    try:
+
+        connection = ConnectHandler(
+
+            device_type=platform,
+            host=host,
+            username=USERNAME,
+            password=PASSWORD,
+
+            conn_timeout=10,
+            auth_timeout=10,
+            banner_timeout=10,
+
+        )
+
+        result["status"] = "UP"
+
+        # CPU
+
+        cpu = get_cpu(connection)
+
+        result["cpu"] = cpu
+
+        if cpu is not None:
+
+            if cpu >= CPU_CRITICAL:
+
+                result["alerts"].append(
+                    f"CPU CRITICAL: {cpu}%"
+                )
+
+            elif cpu >= CPU_WARNING:
+
+                result["alerts"].append(
+                    f"CPU WARNING: {cpu}%"
+                )
+
+        # MEMORY
+
+        memory = get_memory(connection)
+
+        result["memory"] = memory
+
+        if memory is not None:
+
+            if memory >= MEMORY_CRITICAL:
+
+                result["alerts"].append(
+                    f"MEMORY CRITICAL: {memory}%"
+                )
+
+            elif memory >= MEMORY_WARNING:
+
+                result["alerts"].append(
+                    f"MEMORY WARNING: {memory}%"
+                )
+
+        # INTERFACES
+
+        interfaces = get_interfaces(connection)
+
+        interface_summary = analyze_interfaces(
+            interfaces
+        )
+
+        result["interfaces"] = interface_summary
+
+        if interface_summary["operational_down"] > 0:
+
+            result["alerts"].append(
+                f"Operational interfaces DOWN: "
+                f"{interface_summary['operational_down']}"
+            )
+
+        # BGP
+
+        result["bgp"] = get_bgp(connection)
+
+        # OSPF
+
+        result["ospf"] = get_ospf(connection)
+
+        connection.disconnect()
+
+    except Exception as error:
+
+        result["status"] = "DOWN"
+
+        result["alerts"].append(
+            f"SSH/connection error: {str(error)}"
+        )
+
+    # ========================================================
+    # CONSOLE
+    # ========================================================
 
     if result["status"] == "DOWN":
 
-        alerts.append(
-            "CRITICAL: Device unreachable"
+        print(
+            status_critical(
+                "STATUS: DOWN"
+            )
         )
 
-        return alerts
+    else:
 
-    # CPU
-
-    cpu = result["cpu"]
-
-    if cpu is not None:
-
-        if cpu >= CPU_CRITICAL:
-
-            alerts.append(
-                f"CRITICAL: CPU {cpu}%"
+        print(
+            status_ok(
+                "STATUS: UP"
             )
-
-        elif cpu >= CPU_WARNING:
-
-            alerts.append(
-                f"WARNING: CPU {cpu}%"
-            )
-
-    # Memory
-
-    memory = result["memory"]
-
-    if memory is not None:
-
-        if memory >= MEMORY_CRITICAL:
-
-            alerts.append(
-                f"CRITICAL: Memory {memory}%"
-            )
-
-        elif memory >= MEMORY_WARNING:
-
-            alerts.append(
-                f"WARNING: Memory {memory}%"
-            )
-
-    # Interfaces
-
-    for interface in result["interface_problems"]:
-
-        alerts.append(
-            f"WARNING: {interface['interface']} "
-            f"{interface['status']}/{interface['protocol']}"
         )
 
-    # BGP
+    print(
+        f"CPU: {result['cpu']}%"
+    )
 
-    if result["bgp_up"] is not None:
+    print(
+        f"Memory: {result['memory']}%"
+    )
 
-        if result["bgp_down"] > 0:
+    print(
+        "Interfaces: "
+        f"UP={result['interfaces']['up']} "
+        f"ADMIN-DOWN={result['interfaces']['administratively_down']} "
+        f"OP-DOWN={result['interfaces']['operational_down']}"
+    )
 
-            alerts.append(
-                f"CRITICAL: "
-                f"{result['bgp_down']} BGP neighbor(s) down"
+    if result["bgp"] is None:
+
+        print("BGP: N/A")
+
+    else:
+
+        print(
+            f"BGP: "
+            f"{result['bgp']['established']}/"
+            f"{result['bgp']['neighbors']}"
+        )
+
+    if result["ospf"] is None:
+
+        print("OSPF: N/A")
+
+    else:
+
+        print(
+            f"OSPF neighbors: "
+            f"{result['ospf']['neighbors']}"
+        )
+
+    if result["alerts"]:
+
+        for alert in result["alerts"]:
+
+            print(
+                status_warning(
+                    f"ALERT: {alert}"
+                )
             )
 
-    # OSPF
-
-    if result["ospf_up"] is not None:
-
-        if result["ospf_down"] > 0:
-
-            alerts.append(
-                f"CRITICAL: "
-                f"{result['ospf_down']} OSPF neighbor(s) not FULL"
-            )
-
-    return alerts
+    return result
 
 
 # ============================================================
-# LOAD INVENTORY
+# HTML DASHBOARD
 # ============================================================
+
+def generate_dashboard(report):
+
+    rows = ""
+
+    for device in report["devices"]:
+
+        if device["status"] == "UP":
+            status_class = "ok"
+            status_text = "UP"
+        else:
+            status_class = "critical"
+            status_text = "DOWN"
+
+        alerts = "<br>".join(device["alerts"])
+
+        if not alerts:
+            alerts = "None"
+
+        bgp = "N/A"
+
+        if device["bgp"] is not None:
+
+            bgp = (
+                f"{device['bgp']['established']}/"
+                f"{device['bgp']['neighbors']}"
+            )
+
+        ospf = "N/A"
+
+        if device["ospf"] is not None:
+
+            ospf = str(
+                device["ospf"]["neighbors"]
+            )
+
+        rows += f"""
+        <tr>
+            <td><strong>{device['name']}</strong></td>
+            <td>{device['host']}</td>
+            <td>
+                <span class="status {status_class}">
+                    {status_text}
+                </span>
+            </td>
+            <td>{device['cpu']}%</td>
+            <td>{device['memory']}%</td>
+            <td>{device['interfaces']['up']}</td>
+            <td>{device['interfaces']['administratively_down']}</td>
+            <td>{device['interfaces']['operational_down']}</td>
+            <td>{bgp}</td>
+            <td>{ospf}</td>
+            <td>{alerts}</td>
+        </tr>
+        """
+
+    status = report["summary"]["status"]
+
+    if status == "HEALTHY":
+
+        global_class = "ok"
+
+    elif status == "WARNING":
+
+        global_class = "warning"
+
+    else:
+
+        global_class = "critical"
+
+    html = f"""
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta http-equiv="refresh" content="300">
+
+<title>Network Health Dashboard</title>
+
+<style>
+
+body {{
+    font-family: Arial, sans-serif;
+    margin: 30px;
+    background: #f4f6f8;
+    color: #222;
+}}
+
+h1 {{
+    margin-bottom: 5px;
+}}
+
+.timestamp {{
+    color: #666;
+    margin-bottom: 25px;
+}}
+
+.global {{
+    padding: 18px;
+    border-radius: 8px;
+    margin-bottom: 25px;
+    font-size: 22px;
+    font-weight: bold;
+}}
+
+.ok {{
+    color: #0a7a35;
+}}
+
+.warning {{
+    color: #a66a00;
+}}
+
+.critical {{
+    color: #b00020;
+}}
+
+.status {{
+    font-weight: bold;
+}}
+
+table {{
+    border-collapse: collapse;
+    width: 100%;
+    background: white;
+}}
+
+th, td {{
+    border: 1px solid #ddd;
+    padding: 10px;
+    text-align: center;
+}}
+
+th {{
+    background: #222;
+    color: white;
+}}
+
+tr:nth-child(even) {{
+    background: #f7f7f7;
+}}
+
+.summary {{
+    display: flex;
+    gap: 15px;
+    margin-bottom: 25px;
+}}
+
+.card {{
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    min-width: 130px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.15);
+}}
+
+.card-title {{
+    font-size: 13px;
+    color: #777;
+}}
+
+.card-value {{
+    font-size: 28px;
+    font-weight: bold;
+}}
+
+</style>
+
+</head>
+
+<body>
+
+<h1>Network Health Dashboard</h1>
+
+<div class="timestamp">
+Last update: {report['timestamp']}
+</div>
+
+<div class="global {global_class}">
+Network Status: {status}
+</div>
+
+<div class="summary">
+
+<div class="card">
+<div class="card-title">Devices UP</div>
+<div class="card-value">
+{report['summary']['devices_up']}
+</div>
+</div>
+
+<div class="card">
+<div class="card-title">Devices DOWN</div>
+<div class="card-value">
+{report['summary']['devices_down']}
+</div>
+</div>
+
+<div class="card">
+<div class="card-title">Interfaces UP</div>
+<div class="card-value">
+{report['summary']['interfaces_up']}
+</div>
+</div>
+
+<div class="card">
+<div class="card-title">Operational DOWN</div>
+<div class="card-value">
+{report['summary']['interfaces_operational_down']}
+</div>
+</div>
+
+<div class="card">
+<div class="card-title">Alerts</div>
+<div class="card-value">
+{report['summary']['alerts']}
+</div>
+</div>
+
+</div>
+
+<table>
+
+<thead>
+
+<tr>
+
+<th>Device</th>
+<th>IP</th>
+<th>Status</th>
+<th>CPU</th>
+<th>Memory</th>
+<th>UP</th>
+<th>Admin DOWN</th>
+<th>Op DOWN</th>
+<th>BGP</th>
+<th>OSPF</th>
+<th>Alerts</th>
+
+</tr>
+
+</thead>
+
+<tbody>
+
+{rows}
+
+</tbody>
+
+</table>
+
+</body>
+
+</html>
+"""
+
+    dashboard_file = PAGES_DIR / "index.html"
+
+    dashboard_file.write_text(
+        html,
+        encoding="utf-8"
+    )
+
+    return dashboard_file
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+print()
+print("=" * 78)
+print("NETWORK HEALTH MONITOR")
+print("=" * 78)
 
 with open(
     INVENTORY_FILE,
@@ -364,372 +753,285 @@ with open(
 
     inventory = yaml.safe_load(file)
 
-
 devices = inventory["devices"]
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-print()
-
-print("=" * 78)
-print("                         NETWORK HEALTH V2")
-print("=" * 78)
-
-print()
-
-print(
-    f"Devices in inventory: {len(devices)}"
-)
-
-print()
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
 
 results = []
 
-
-for device_info in devices:
-
-    name = device_info["name"]
-    host = device_info["host"]
-    platform = device_info["platform"]
-
-    print("-" * 78)
-
-    print(
-        f"Device : {name}"
-    )
-
-    print(
-        f"IP     : {host}"
-    )
-
-    print("-" * 78)
-
-    device = {
-        "device_type": platform,
-        "host": host,
-        "username": USERNAME,
-        "password": PASSWORD,
-        "port": 22,
-    }
-
-    connection = None
-
-    result = {
-        "name": name,
-        "host": host,
-        "status": "DOWN",
-        "cpu": None,
-        "memory": None,
-        "interfaces": [],
-        "interfaces_up": 0,
-        "interfaces_admin_down": 0,
-        "interfaces_down": 0,
-        "interface_problems": [],
-        "bgp_up": None,
-        "bgp_down": None,
-        "ospf_up": None,
-        "ospf_down": None,
-    }
-
-    try:
-
-        print(
-            "Connecting..."
-        )
-
-        connection = ConnectHandler(
-            **device
-        )
-
-        result["status"] = "UP"
-
-        print(
-            status_ok(
-                "[OK] SSH connection"
-            )
-        )
-
-        # CPU
-
-        result["cpu"] = get_cpu(
-            connection
-        )
-
-        # MEMORY
-
-        result["memory"] = get_memory(
-            connection
-        )
-
-        # INTERFACES
-
-        interfaces = get_interfaces(
-            connection
-        )
-
-        result["interfaces"] = interfaces
-
-        (
-            result["interfaces_up"],
-            result["interfaces_admin_down"],
-            result["interfaces_down"],
-            result["interface_problems"],
-        ) = analyze_interfaces(
-            interfaces
-        )
-
-        # BGP
-
-        (
-            result["bgp_up"],
-            result["bgp_down"],
-        ) = get_bgp(
-            connection
-        )
-
-        # OSPF
-
-        (
-            result["ospf_up"],
-            result["ospf_down"],
-        ) = get_ospf(
-            connection
-        )
-
-        print(
-            status_ok(
-                "[OK] Health data collected"
-            )
-        )
-
-    except Exception as error:
-
-        print(
-            status_critical(
-                f"[ERROR] {error}"
-            )
-        )
-
-    finally:
-
-        if connection:
-
-            connection.disconnect()
-
-            print(
-                "[OK] Connection closed"
-            )
-
-    # Analyze
-
-    result["alerts"] = analyze_device(
-        result
-    )
+for device in devices:
 
     results.append(
-        result
+        analyze_device(device)
     )
-
-    print()
 
 
 # ============================================================
 # SUMMARY
 # ============================================================
 
-print()
-
-print("=" * 78)
-print("                           SUMMARY")
-print("=" * 78)
-
-print()
-
-print(
-    f"{'DEVICE':<10}"
-    f"{'STATUS':<10}"
-    f"{'CPU':<8}"
-    f"{'MEM':<8}"
-    f"{'INT':<12}"
-    f"{'BGP':<10}"
-    f"{'OSPF':<10}"
-)
-
-print("-" * 78)
-
-
-for result in results:
-
-    if result["status"] == "UP":
-
-        if result["alerts"]:
-
-            status = status_warning(
-                "WARNING"
-            )
-
-        else:
-
-            status = status_ok(
-                "UP"
-            )
-
-    else:
-
-        status = status_critical(
-            "DOWN"
-        )
-
-    cpu = (
-        f"{result['cpu']}%"
-        if result["cpu"] is not None
-        else "-"
-    )
-
-    memory = (
-        f"{result['memory']}%"
-        if result["memory"] is not None
-        else "-"
-    )
-
-    interfaces = (
-        f"{result['interfaces_up']} UP / "
-        f"{result['interfaces_down']} DOWN"
-    )
-
-    if result["bgp_up"] is None:
-
-        bgp = "N/A"
-
-    else:
-
-        bgp = (
-            f"{result['bgp_up']} UP / "
-            f"{result['bgp_down']} DOWN"
-        )
-
-    if result["ospf_up"] is None:
-
-        ospf = "N/A"
-
-    else:
-
-        ospf = (
-            f"{result['ospf_up']} UP / "
-            f"{result['ospf_down']} DOWN"
-        )
-
-    print(
-        f"{result['name']:<10}"
-        f"{status:<19}"
-        f"{cpu:<8}"
-        f"{memory:<8}"
-        f"{interfaces:<12}"
-        f"{bgp:<10}"
-        f"{ospf:<10}"
-    )
-
-
-# ============================================================
-# ALERTS
-# ============================================================
-
-print()
-
-print("=" * 78)
-print("                            ALERTS")
-print("=" * 78)
-
-print()
-
-total_alerts = 0
-
-
-for result in results:
-
-    if not result["alerts"]:
-        continue
-
-    print(
-        f"{result['name']}:"
-    )
-
-    for alert in result["alerts"]:
-
-        total_alerts += 1
-
-        if "CRITICAL" in alert:
-
-            print(
-                status_critical(
-                    f"  🔴 {alert}"
-                )
-            )
-
-        else:
-
-            print(
-                status_warning(
-                    f"  🟡 {alert}"
-                )
-            )
-
-    print()
-
-
-# ============================================================
-# FINAL STATUS
-# ============================================================
-
 devices_up = sum(
     1
-    for result in results
-    if result["status"] == "UP"
+    for device in results
+    if device["status"] == "UP"
 )
 
 devices_down = len(results) - devices_up
 
-
-print("=" * 78)
-
-print(
-    f"Devices UP       : {devices_up}"
+interfaces_up = sum(
+    device["interfaces"]["up"]
+    for device in results
 )
 
-print(
-    f"Devices DOWN     : {devices_down}"
+interfaces_admin_down = sum(
+    device["interfaces"]["administratively_down"]
+    for device in results
 )
 
-print(
-    f"Total alerts     : {total_alerts}"
+interfaces_operational_down = sum(
+    device["interfaces"]["operational_down"]
+    for device in results
 )
 
-print("=" * 78)
-
-print()
-
+total_alerts = sum(
+    len(device["alerts"])
+    for device in results
+)
 
 if devices_down > 0:
 
-    print(
-        status_critical(
-            "🔴 NETWORK STATUS: CRITICAL"
-        )
-    )
+    network_status = "CRITICAL"
 
 elif total_alerts > 0:
 
+    network_status = "WARNING"
+
+else:
+
+    network_status = "HEALTHY"
+
+
+timestamp = datetime.now().strftime(
+    "%Y-%m-%d %H:%M:%S"
+)
+
+timestamp_file = datetime.now().strftime(
+    "%Y%m%d_%H%M%S"
+)
+
+
+report = {
+
+    "timestamp": timestamp,
+
+    "summary": {
+
+        "status": network_status,
+
+        "devices_total": len(results),
+
+        "devices_up": devices_up,
+
+        "devices_down": devices_down,
+
+        "interfaces_up": interfaces_up,
+
+        "interfaces_admin_down": interfaces_admin_down,
+
+        "interfaces_operational_down":
+            interfaces_operational_down,
+
+        "alerts": total_alerts,
+
+    },
+
+    "devices": results,
+
+}
+
+
+# ============================================================
+# JSON
+# ============================================================
+
+json_file = (
+    REPORT_DIR
+    / f"network_health_{timestamp_file}.json"
+)
+
+json_latest = (
+    REPORT_DIR
+    / "network_health_latest.json"
+)
+
+with open(
+    json_file,
+    "w",
+    encoding="utf-8"
+) as file:
+
+    json.dump(
+        report,
+        file,
+        indent=4,
+        ensure_ascii=False
+    )
+
+with open(
+    json_latest,
+    "w",
+    encoding="utf-8"
+) as file:
+
+    json.dump(
+        report,
+        file,
+        indent=4,
+        ensure_ascii=False
+    )
+
+
+# ============================================================
+# TXT
+# ============================================================
+
+txt_file = (
+    REPORT_DIR
+    / f"network_health_{timestamp_file}.txt"
+)
+
+txt_latest = (
+    REPORT_DIR
+    / "network_health_latest.txt"
+)
+
+lines = []
+
+lines.append(
+    "NETWORK HEALTH REPORT"
+)
+
+lines.append(
+    "=" * 78
+)
+
+lines.append(
+    f"Timestamp: {timestamp}"
+)
+
+lines.append(
+    f"Network Status: {network_status}"
+)
+
+lines.append("")
+
+for device in results:
+
+    lines.append(
+        f"{device['name']} "
+        f"{device['host']} "
+        f"{device['status']}"
+    )
+
+    lines.append(
+        f"CPU: {device['cpu']}%"
+    )
+
+    lines.append(
+        f"Memory: {device['memory']}%"
+    )
+
+    lines.append(
+        "Interfaces: "
+        f"UP={device['interfaces']['up']} "
+        f"ADMIN-DOWN="
+        f"{device['interfaces']['administratively_down']} "
+        f"OP-DOWN="
+        f"{device['interfaces']['operational_down']}"
+    )
+
+    if device["bgp"] is None:
+
+        lines.append(
+            "BGP: N/A"
+        )
+
+    else:
+
+        lines.append(
+            f"BGP: "
+            f"{device['bgp']['established']}/"
+            f"{device['bgp']['neighbors']}"
+        )
+
+    if device["ospf"] is None:
+
+        lines.append(
+            "OSPF: N/A"
+        )
+
+    else:
+
+        lines.append(
+            f"OSPF neighbors: "
+            f"{device['ospf']['neighbors']}"
+        )
+
+    if device["alerts"]:
+
+        lines.append(
+            "Alerts:"
+        )
+
+        for alert in device["alerts"]:
+
+            lines.append(
+                f"  - {alert}"
+            )
+
+    lines.append("")
+
+
+txt_content = "\n".join(lines)
+
+txt_file.write_text(
+    txt_content,
+    encoding="utf-8"
+)
+
+txt_latest.write_text(
+    txt_content,
+    encoding="utf-8"
+)
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+dashboard_file = generate_dashboard(
+    report
+)
+
+
+# ============================================================
+# FINAL OUTPUT
+# ============================================================
+
+print()
+print("=" * 78)
+
+if network_status == "CRITICAL":
+
+    print(
+        status_critical(
+            "NETWORK STATUS: CRITICAL"
+        )
+    )
+
+elif network_status == "WARNING":
+
     print(
         status_warning(
-            "🟡 NETWORK STATUS: WARNING"
+            "NETWORK STATUS: WARNING"
         )
     )
 
@@ -737,8 +1039,32 @@ else:
 
     print(
         status_ok(
-            "🟢 NETWORK STATUS: HEALTHY"
+            "NETWORK STATUS: HEALTHY"
         )
     )
+
+print("=" * 78)
+
+print()
+
+print(
+    f"JSON report : {json_file}"
+)
+
+print(
+    f"JSON latest : {json_latest}"
+)
+
+print(
+    f"TXT report  : {txt_file}"
+)
+
+print(
+    f"TXT latest  : {txt_latest}"
+)
+
+print(
+    f"Dashboard   : {dashboard_file}"
+)
 
 print()
