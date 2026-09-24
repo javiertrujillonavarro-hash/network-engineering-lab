@@ -1,0 +1,19 @@
+--- R4/previous.cfg
++++ R4/current.cfg
+@@ -2,7 +2,7 @@
+ service timestamps debug datetime msec
+ service timestamps log datetime msec
+ no service password-encryption
+-hostname R4
++hostname R2
+ boot-start-marker
+ boot-end-marker
+ no aaa new-model
+@@ -11,6 +11,7 @@
+ no mmi auto-configure
+ no mmi pvc
+ mmi snmp-timeout 180
++ip domain list test
+ ip domain name test
+ ip cef
+ no ipv6 cef
