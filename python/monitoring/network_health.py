@@ -13,15 +13,20 @@ from netmiko import ConnectHandler
 # CONFIGURATION
 # ============================================================
 
-load_dotenv()
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_DIR = SCRIPT_DIR.parent.parent
+
+ENV_FILE = PROJECT_DIR / ".env"
+load_dotenv(ENV_FILE)
 
 USERNAME = os.getenv("CISCO_USERNAME")
 PASSWORD = os.getenv("CISCO_PASSWORD")
 
-SCRIPT_DIR = Path(__file__).parent
 INVENTORY_FILE = SCRIPT_DIR.parent / "backup" / "inventory.yaml"
+
 REPORT_DIR = SCRIPT_DIR / "reports"
-PAGES_DIR = SCRIPT_DIR.parent.parent / "docs"
+
+PAGES_DIR = PROJECT_DIR / "docs"
 PAGES_DIR.mkdir(exist_ok=True)
 
 REPORT_DIR.mkdir(exist_ok=True)
@@ -31,7 +36,6 @@ CPU_CRITICAL = 90
 
 MEMORY_WARNING = 70
 MEMORY_CRITICAL = 90
-
 
 # ============================================================
 # COLORS
